@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "meme-server": {
+      "command": "python",
+      "args": [
+        "E:\\CherryStudioDaTa\\Agent\\论文\\meme-mcp\\meme_server.py"
+      ]
+    }
+  }
+}
