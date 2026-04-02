@@ -9,8 +9,13 @@ import json
 import asyncio
 import socket
 import threading
+import shutil
+import difflib
+import urllib.request
+import mimetypes
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 from mcp.server.models import InitializationOptions
 import mcp.types as types
 from mcp.server import NotificationOptions, Server
@@ -143,7 +148,7 @@ async def handle_list_tools() -> list[types.Tool]:
     return [
         types.Tool(
             name="list_memes",
-            description="获取所有可用表情包的名称列表",
+            description="当你想了解有哪些表情包可用时使用。这会返回所有表情包名称列表。如果你不知道该用哪个表情包，可以先列出所有选项。",
             inputSchema={
                 "type": "object",
                 "properties": {},
@@ -152,13 +157,13 @@ async def handle_list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="get_meme",
-            description="根据名称获取表情包的 HTTP URL（会自动启动静态资源服务器）",
+            description="根据准确名称获取表情包的URL。当你已经通过搜索或列表确定了表情包名称后使用此工具。",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "name": {
                         "type": "string",
-                        "description": "表情包的名称"
+                        "description": "表情包的准确名称"
                     }
                 },
                 "required": ["name"]
@@ -166,39 +171,53 @@ async def handle_list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="add_meme",
-            description="添加新的表情包到索引（需要先将图片文件放到memes目录）",
+            description="添加新的表情包。支持从本地文件路径或网络URL添加。当用户想要保存或收藏一张新图片作为表情包时使用。",
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": "图片来源：可以是本地文件的绝对路径，也可以是网络图片的URL"
+                    },
                     "name": {
                         "type": "string",
-                        "description": "表情包的名称（用于查询）"
-                    },
-                    "filename": {
-                        "type": "string",
-                        "description": "图片文件名（包含扩展名）"
+                        "description": "为表情包起的名字,不用包括后缀（可选，若不提供则尝试从文件名推断）"
                     }
                 },
-                "required": ["name", "filename"]
+                "required": ["source"]
             },
         ),
         types.Tool(
             name="search_memes",
-            description="根据关键词搜索表情包",
+            description="搜索表情包。当你想要表达某种情绪（如'开心'、'惊讶'）或寻找特定主题的图片时使用。支持模糊匹配和相似推荐。",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "keyword": {
                         "type": "string",
-                        "description": "搜索关键词"
+                        "description": "搜索关键词，描述你想要表达的情绪或内容"
                     }
                 },
                 "required": ["keyword"]
             },
         ),
         types.Tool(
+            name="delete_meme",
+            description="删除表情包。当某个表情包不再需要时使用，会从列表和磁盘中永久删除。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "要删除的表情包名称"
+                    }
+                },
+                "required": ["name"]
+            },
+        ),
+        types.Tool(
             name="check_server",
-            description="检查静态资源服务器的运行状态",
+            description="检查图片服务器是否正常运行。通常不需要主动调用，除非遇到图片无法显示的问题。",
             inputSchema={
                 "type": "object",
                 "properties": {},
@@ -221,7 +240,7 @@ async def handle_call_tool(
         if not meme_index:
             return [types.TextContent(
                 type="text",
-                text="暂无表情包。请将图片文件放到 memes 目录中。"
+                text="暂无表情包。请使用 add_meme 添加图片。"
             )]
 
         meme_list = "\n".join([f"- {name}" for name in sorted(meme_index.keys())])
@@ -239,9 +258,14 @@ async def handle_call_tool(
         meme_index = load_meme_index()
 
         if meme_name not in meme_index:
+            # 尝试模糊搜索推荐
+            all_names = list(meme_index.keys())
+            suggestions = difflib.get_close_matches(meme_name, all_names, n=3, cutoff=0.6)
+            suggestion_text = f"\n\n你是不是想找：{', '.join(suggestions)}" if suggestions else ""
+            
             return [types.TextContent(
                 type="text",
-                text=f"未找到名为 '{meme_name}' 的表情包。\n\n##提示：所有表情包都在统一路径，如: http://localhost:8000/点头.gif ；替换文件名【点头.gif】,使用markdown格式即可直接引用，不用再查询地址。##\n\n可用的表情包：{', '.join(sorted(meme_index.keys()))}"
+                text=f"未找到名为 '{meme_name}' 的表情包。{suggestion_text}\n\n可用的表情包：{', '.join(sorted(meme_index.keys()))}"
             )]
 
         filename = meme_index[meme_name]
@@ -265,29 +289,100 @@ async def handle_call_tool(
 
     elif name == "add_meme":
         # 添加新表情包到索引
-        if not arguments or "name" not in arguments or "filename" not in arguments:
-            raise ValueError("缺少参数: name 和 filename")
+        if not arguments or "source" not in arguments:
+            raise ValueError("缺少参数: source")
 
-        meme_name = arguments["name"]
-        filename = arguments["filename"]
+        source = arguments["source"]
+        meme_name = arguments.get("name")
+        
+        try:
+            # 确定文件名和扩展名
+            filename = ""
+            extension = ""
+            
+            # 检查是否为 URL
+            is_url = source.startswith("http://") or source.startswith("https://")
+            
+            if is_url:
+                # 从 URL 下载
+                req = urllib.request.Request(source, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req) as response:
+                    content_type = response.headers.get('Content-Type')
+                    if content_type:
+                        extension = mimetypes.guess_extension(content_type)
+                    
+                    if not extension:
+                         parsed = urlparse(source)
+                         path = parsed.path
+                         ext = os.path.splitext(path)[1]
+                         if ext:
+                             extension = ext
 
-        # 检查文件是否存在
-        file_path = MEMES_DIR / filename
-        if not file_path.exists():
+                    if not extension:
+                        extension = ".jpg" # 默认 fallback
+                        
+                    # 如果没有提供名称，尝试从 URL 生成
+                    if not meme_name:
+                         parsed = urlparse(source)
+                         path = parsed.path
+                         base = os.path.basename(path)
+                         name_part = os.path.splitext(base)[0]
+                         if name_part:
+                             meme_name = name_part
+                         else:
+                             import time
+                             meme_name = f"meme_{int(time.time())}"
+                    
+                    if meme_name.lower().endswith(extension.lower()):
+                        filename = meme_name
+                    else:
+                        filename = f"{meme_name}{extension}"
+                    dest_path = MEMES_DIR / filename
+                    
+                    with open(dest_path, 'wb') as f:
+                        f.write(response.read())
+                        
+            else:
+                # 本地文件
+                source_path = Path(source)
+                if not source_path.exists():
+                     return [types.TextContent(type="text", text=f"错误：找不到本地文件 '{source}'")]
+                
+                if not meme_name:
+                    meme_name = source_path.stem
+                    
+                extension = source_path.suffix
+                if not extension:
+                     kind = mimetypes.guess_type(source)[0]
+                     if kind:
+                         extension = mimetypes.guess_extension(kind) or ".jpg"
+                     else:
+                         extension = ".jpg"
+
+                if meme_name.lower().endswith(extension.lower()):
+                    filename = meme_name
+                else:
+                    filename = f"{meme_name}{extension}"
+                dest_path = MEMES_DIR / filename
+                
+                # 如果源文件和目标文件不同，则复制
+                if source_path.absolute() != dest_path.absolute():
+                    shutil.copy2(source_path, dest_path)
+
+            # 更新索引
+            meme_index = load_meme_index()
+            meme_index[meme_name] = filename
+            save_meme_index(meme_index)
+            
+            ensure_static_server()
+            
             return [types.TextContent(
                 type="text",
-                text=f"错误：文件 '{filename}' 不存在于 memes 目录中。\n请先将图片文件复制到: {MEMES_DIR.absolute()}"
+                text=f"成功添加表情包: {meme_name}\n保存为: {filename}\n\n访问地址: http://{STATIC_SERVER_HOST}:{STATIC_SERVER_PORT}/{filename}"
             )]
-
-        # 更新索引
-        meme_index = load_meme_index()
-        meme_index[meme_name] = filename
-        save_meme_index(meme_index)
-
-        return [types.TextContent(
-            type="text",
-            text=f"成功添加表情包: {meme_name} -> {filename}\n\n访问地址: http://{STATIC_SERVER_HOST}:{STATIC_SERVER_PORT}/{filename}"
-        )]
+            
+        except Exception as e:
+             return [types.TextContent(type="text", text=f"添加表情包失败: {str(e)}")]
 
     elif name == "search_memes":
         # 搜索表情包
@@ -296,21 +391,71 @@ async def handle_call_tool(
 
         keyword = arguments["keyword"].lower()
         meme_index = load_meme_index()
+        all_names = list(meme_index.keys())
 
-        # 搜索名称中包含关键词的表情包
-        results = [name for name in meme_index.keys() if keyword in name.lower()]
+        # 1. 精确/子串匹配
+        results = [name for name in all_names if keyword in name.lower()]
+        
+        # 2. 模糊匹配推荐
+        fuzzy_matches = difflib.get_close_matches(keyword, all_names, n=5, cutoff=0.4)
+        recommendations = [m for m in fuzzy_matches if m not in results]
 
-        if not results:
+        if not results and not recommendations:
             return [types.TextContent(
                 type="text",
-                text=f"未找到包含 '{keyword}' 的表情包。"
+                text=f"未找到包含 '{keyword}' 的表情包，也没找到相似名称。"
             )]
 
-        result_list = "\n".join([f"- {name}" for name in sorted(results)])
+        response_text = ""
+        
+        if results:
+            result_list = "\n".join([f"- {name}" for name in sorted(results)])
+            response_text += f"搜索结果（共 {len(results)} 个）：\n\n{result_list}\n"
+            
+        if recommendations:
+            rec_list = "\n".join([f"- {name}" for name in recommendations])
+            response_text += f"\n相似推荐：\n\n{rec_list}"
+
         return [types.TextContent(
             type="text",
-            text=f"搜索结果（共 {len(results)} 个）：\n\n{result_list}"
+            text=response_text
         )]
+
+    elif name == "delete_meme":
+        # 删除表情包
+        if not arguments or "name" not in arguments:
+            raise ValueError("缺少参数: name")
+
+        meme_name = arguments["name"]
+        meme_index = load_meme_index()
+
+        if meme_name not in meme_index:
+             return [types.TextContent(
+                type="text",
+                text=f"未找到名为 '{meme_name}' 的表情包，无法删除。"
+            )]
+
+        filename = meme_index[meme_name]
+        file_path = MEMES_DIR / filename
+        
+        try:
+            # 从磁盘删除文件
+            if file_path.exists():
+                file_path.unlink()
+            
+            # 从索引中删除
+            del meme_index[meme_name]
+            save_meme_index(meme_index)
+            
+            return [types.TextContent(
+                type="text",
+                text=f"已成功删除表情包: {meme_name} (文件: {filename})"
+            )]
+        except Exception as e:
+            return [types.TextContent(
+                type="text",
+                text=f"删除表情包失败: {str(e)}"
+            )]
 
     elif name == "check_server":
         # 检查静态资源服务器状态
